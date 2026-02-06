@@ -29,6 +29,13 @@ struct AppState {
     api_auth_secret: Option<String>,
 }
 
+#[derive(Debug)]
+struct RequestCtx {
+    pool: PgPool,
+    owner_id: String,
+    user_id: String,
+}
+
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     status: &'static str,
@@ -490,6 +497,17 @@ fn require_database(state: &AppState) -> Result<PgPool, ApiError> {
         .ok_or_else(|| ApiError::service_unavailable("database is not configured"))
 }
 
+async fn request_ctx(headers: &HeaderMap, state: &AppState) -> Result<RequestCtx, ApiError> {
+    let pool = require_database(state)?;
+    let user_id = current_user_id(headers, state)?;
+    let owner_id = owner_id_for_user(&pool, &user_id).await?;
+    Ok(RequestCtx {
+        pool,
+        owner_id,
+        user_id,
+    })
+}
+
 fn current_user_id(headers: &HeaderMap, state: &AppState) -> Result<String, ApiError> {
     let secret = state
         .api_auth_secret
@@ -637,16 +655,14 @@ async fn list_packages(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<ListPackagesResponse>, ApiError> {
-    let pool = require_database(&state)?;
-    let user_id = current_user_id(&headers, &state)?;
-    let owner_id = owner_id_for_user(&pool, &user_id).await?;
+    let ctx = request_ctx(&headers, &state).await?;
 
     let rows = sqlx::query(
         "SELECT id::text, name, visibility::text AS visibility, description \
          FROM packages WHERE owner_id = $1::uuid ORDER BY name",
     )
-    .bind(owner_id)
-    .fetch_all(&pool)
+    .bind(&ctx.owner_id)
+    .fetch_all(&ctx.pool)
     .await
     .map_err(|err| ApiError::internal(format!("failed to list packages: {err}")))?;
 
@@ -668,9 +684,7 @@ async fn create_package(
     headers: HeaderMap,
     Json(request): Json<CreatePackageRequest>,
 ) -> Result<Json<CreatePackageResponse>, ApiError> {
-    let pool = require_database(&state)?;
-    let user_id = current_user_id(&headers, &state)?;
-    let owner_id = owner_id_for_user(&pool, &user_id).await?;
+    let ctx = request_ctx(&headers, &state).await?;
     let visibility = normalize_visibility(request.visibility)?;
     let name = request.name.trim();
     if name.is_empty() {
@@ -682,11 +696,11 @@ async fn create_package(
          VALUES ($1::uuid, $2, $3::package_visibility, $4) \
          RETURNING id::text, name, visibility::text AS visibility, description",
     )
-    .bind(owner_id)
+    .bind(&ctx.owner_id)
     .bind(name)
     .bind(visibility)
     .bind(request.description)
-    .fetch_one(&pool)
+    .fetch_one(&ctx.pool)
     .await;
 
     let row = match result {
@@ -717,9 +731,7 @@ async fn publish_package_version(
     Path(package): Path<String>,
     Json(request): Json<PublishPackageVersionRequest>,
 ) -> Result<Json<PublishPackageVersionResponse>, ApiError> {
-    let pool = require_database(&state)?;
-    let user_id = current_user_id(&headers, &state)?;
-    let owner_id = owner_id_for_user(&pool, &user_id).await?;
+    let ctx = request_ctx(&headers, &state).await?;
 
     let manifest_bytes = serde_json::to_vec(&request.manifest)
         .map_err(|err| ApiError::bad_request(format!("manifest serialization failed: {err}")))?;
@@ -732,7 +744,7 @@ async fn publish_package_version(
         ));
     }
 
-    let package_id = package_id_for_owner(&pool, &owner_id, &package).await?;
+    let package_id = package_id_for_owner(&ctx.pool, &ctx.owner_id, &package).await?;
 
     let version_insert = sqlx::query(
         "INSERT INTO package_versions (package_id, version, artifact_digest, manifest_json, published_by_user_id) \
@@ -742,8 +754,8 @@ async fn publish_package_version(
     .bind(&manifest.version)
     .bind(&manifest.artifact)
     .bind(request.manifest)
-    .bind(&user_id)
-    .execute(&pool)
+    .bind(&ctx.user_id)
+    .execute(&ctx.pool)
     .await;
 
     match version_insert {
@@ -770,17 +782,15 @@ async fn list_package_versions(
     headers: HeaderMap,
     Path(package): Path<String>,
 ) -> Result<Json<ListPackageVersionsResponse>, ApiError> {
-    let pool = require_database(&state)?;
-    let user_id = current_user_id(&headers, &state)?;
-    let owner_id = owner_id_for_user(&pool, &user_id).await?;
-    let package_id = package_id_for_owner(&pool, &owner_id, &package).await?;
+    let ctx = request_ctx(&headers, &state).await?;
+    let package_id = package_id_for_owner(&ctx.pool, &ctx.owner_id, &package).await?;
 
     let rows = sqlx::query(
         "SELECT version, artifact_digest, published_at::text, deprecated_at::text \
          FROM package_versions WHERE package_id = $1::uuid ORDER BY published_at DESC",
     )
     .bind(package_id)
-    .fetch_all(&pool)
+    .fetch_all(&ctx.pool)
     .await
     .map_err(|err| ApiError::internal(format!("failed to list package versions: {err}")))?;
 
@@ -802,10 +812,8 @@ async fn deprecate_package_version(
     headers: HeaderMap,
     Path((package, version)): Path<(String, String)>,
 ) -> Result<Json<DeprecatePackageVersionResponse>, ApiError> {
-    let pool = require_database(&state)?;
-    let user_id = current_user_id(&headers, &state)?;
-    let owner_id = owner_id_for_user(&pool, &user_id).await?;
-    let package_id = package_id_for_owner(&pool, &owner_id, &package).await?;
+    let ctx = request_ctx(&headers, &state).await?;
+    let package_id = package_id_for_owner(&ctx.pool, &ctx.owner_id, &package).await?;
 
     let row = sqlx::query(
         "UPDATE package_versions \
@@ -815,7 +823,7 @@ async fn deprecate_package_version(
     )
     .bind(package_id)
     .bind(&version)
-    .fetch_optional(&pool)
+    .fetch_optional(&ctx.pool)
     .await
     .map_err(|err| ApiError::internal(format!("failed to deprecate package version: {err}")))?;
 
@@ -835,9 +843,7 @@ async fn list_contexts(
     headers: HeaderMap,
     Query(query): Query<ListContextsQuery>,
 ) -> Result<Json<ListContextsResponse>, ApiError> {
-    let pool = require_database(&state)?;
-    let user_id = current_user_id(&headers, &state)?;
-    let owner_id = owner_id_for_user(&pool, &user_id).await?;
+    let ctx = request_ctx(&headers, &state).await?;
     let status = normalize_context_status(query.status)?;
     let limit = normalize_limit(query.limit, 50, 200);
 
@@ -862,10 +868,10 @@ async fn list_contexts(
          ORDER BY c.started_at DESC
          LIMIT $3",
     )
-    .bind(owner_id)
+    .bind(&ctx.owner_id)
     .bind(status.as_deref())
     .bind(limit)
-    .fetch_all(&pool)
+    .fetch_all(&ctx.pool)
     .await
     .map_err(|err| ApiError::internal(format!("failed to list contexts: {err}")))?;
 
@@ -891,9 +897,7 @@ async fn create_context(
     headers: HeaderMap,
     Json(request): Json<CreateContextRequest>,
 ) -> Result<Json<CreateContextResponse>, ApiError> {
-    let pool = require_database(&state)?;
-    let user_id = current_user_id(&headers, &state)?;
-    let owner_id = owner_id_for_user(&pool, &user_id).await?;
+    let ctx = request_ctx(&headers, &state).await?;
     let status = normalize_context_status_required(request.status.trim())?;
     let region = request.region.trim();
     if region.is_empty() {
@@ -913,10 +917,10 @@ async fn create_context(
                  WHERE p.owner_id = $1::uuid AND p.name = $2 AND pv.version = $3
                  LIMIT 1",
             )
-            .bind(&owner_id)
+            .bind(&ctx.owner_id)
             .bind(package)
             .bind(version)
-            .fetch_optional(&pool)
+            .fetch_optional(&ctx.pool)
             .await
             .map_err(|err| ApiError::internal(format!("failed package version lookup: {err}")))?;
 
@@ -937,11 +941,11 @@ async fn create_context(
          VALUES ($1::uuid, $2::uuid, $3::context_status, $4)
          RETURNING id::text, status::text AS status, region, started_at::text AS started_at, ended_at::text AS ended_at",
     )
-    .bind(&owner_id)
+    .bind(&ctx.owner_id)
     .bind(package_version_id.as_deref())
     .bind(&status)
     .bind(region)
-    .fetch_one(&pool)
+    .fetch_one(&ctx.pool)
     .await
     .map_err(|err| ApiError::internal(format!("failed to create context: {err}")))?;
 
@@ -964,9 +968,7 @@ async fn get_context(
     headers: HeaderMap,
     Path(context_id): Path<String>,
 ) -> Result<Json<GetContextResponse>, ApiError> {
-    let pool = require_database(&state)?;
-    let user_id = current_user_id(&headers, &state)?;
-    let owner_id = owner_id_for_user(&pool, &user_id).await?;
+    let ctx = request_ctx(&headers, &state).await?;
 
     let row = sqlx::query(
         "SELECT
@@ -986,9 +988,9 @@ async fn get_context(
          LEFT JOIN packages p ON p.id = pv.package_id
          WHERE c.owner_id = $1::uuid AND c.id = $2::uuid",
     )
-    .bind(owner_id)
+    .bind(&ctx.owner_id)
     .bind(&context_id)
-    .fetch_optional(&pool)
+    .fetch_optional(&ctx.pool)
     .await
     .map_err(|err| ApiError::internal(format!("failed to load context: {err}")))?;
 
@@ -1016,18 +1018,17 @@ async fn update_context(
     Path(context_id): Path<String>,
     Json(request): Json<UpdateContextRequest>,
 ) -> Result<Json<UpdateContextResponse>, ApiError> {
-    let pool = require_database(&state)?;
-    let user_id = current_user_id(&headers, &state)?;
-    let owner_id = owner_id_for_user(&pool, &user_id).await?;
+    let ctx = request_ctx(&headers, &state).await?;
     let status = normalize_context_status_required(request.status.trim())?;
-    let mut tx = pool
+    let mut tx = ctx
+        .pool
         .begin()
         .await
         .map_err(|err| ApiError::internal(format!("failed to start transaction: {err}")))?;
 
     let current = sqlx::query("SELECT status::text AS status FROM contexts WHERE id = $1::uuid AND owner_id = $2::uuid FOR UPDATE")
         .bind(&context_id)
-        .bind(&owner_id)
+        .bind(&ctx.owner_id)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|err| ApiError::internal(format!("failed to load context before update: {err}")))?;
@@ -1047,7 +1048,7 @@ async fn update_context(
          WHERE id = $1::uuid AND owner_id = $2::uuid",
     )
     .bind(&context_id)
-    .bind(&owner_id)
+    .bind(&ctx.owner_id)
     .bind(&status)
     .execute(&mut *tx)
     .await
@@ -1060,7 +1061,7 @@ async fn update_context(
             "event": "context.status_changed",
             "from": previous_status,
             "to": status,
-            "actor_user_id": user_id,
+            "actor_user_id": ctx.user_id,
             "source": "control-plane",
         });
 
@@ -1097,7 +1098,7 @@ async fn update_context(
          LEFT JOIN packages p ON p.id = pv.package_id
          WHERE c.owner_id = $1::uuid AND c.id = $2::uuid",
     )
-    .bind(&owner_id)
+    .bind(&ctx.owner_id)
     .bind(&context_id)
     .fetch_one(&mut *tx)
     .await
@@ -1127,9 +1128,7 @@ async fn list_context_logs(
     Path(context_id): Path<String>,
     Query(query): Query<ListContextLogsQuery>,
 ) -> Result<Json<ListContextLogsResponse>, ApiError> {
-    let pool = require_database(&state)?;
-    let user_id = current_user_id(&headers, &state)?;
-    let owner_id = owner_id_for_user(&pool, &user_id).await?;
+    let ctx = request_ctx(&headers, &state).await?;
     let limit = normalize_limit(query.limit, 50, 200);
     let from = normalize_rfc3339_timestamp("from", query.from)?;
     let to = normalize_rfc3339_timestamp("to", query.to)?;
@@ -1137,8 +1136,8 @@ async fn list_context_logs(
     let context_exists =
         sqlx::query("SELECT 1 FROM contexts WHERE id = $1::uuid AND owner_id = $2::uuid LIMIT 1")
             .bind(&context_id)
-            .bind(&owner_id)
-            .fetch_optional(&pool)
+            .bind(&ctx.owner_id)
+            .fetch_optional(&ctx.pool)
             .await
             .map_err(|err| {
                 ApiError::internal(format!("failed to verify context ownership: {err}"))
@@ -1167,7 +1166,7 @@ async fn list_context_logs(
     .bind(from.as_deref())
     .bind(to.as_deref())
     .bind(limit)
-    .fetch_all(&pool)
+    .fetch_all(&ctx.pool)
     .await
     .map_err(|err| ApiError::internal(format!("failed to list context logs: {err}")))?;
 
@@ -1196,9 +1195,7 @@ async fn append_context_log(
     Path(context_id): Path<String>,
     Json(request): Json<AppendContextLogRequest>,
 ) -> Result<Json<AppendContextLogResponse>, ApiError> {
-    let pool = require_database(&state)?;
-    let user_id = current_user_id(&headers, &state)?;
-    let owner_id = owner_id_for_user(&pool, &user_id).await?;
+    let ctx = request_ctx(&headers, &state).await?;
     let severity = normalize_log_severity(request.severity.trim())?;
     let message = request.message.trim();
     if message.is_empty() {
@@ -1208,8 +1205,8 @@ async fn append_context_log(
     let context_exists =
         sqlx::query("SELECT 1 FROM contexts WHERE id = $1::uuid AND owner_id = $2::uuid LIMIT 1")
             .bind(&context_id)
-            .bind(&owner_id)
-            .fetch_optional(&pool)
+            .bind(&ctx.owner_id)
+            .fetch_optional(&ctx.pool)
             .await
             .map_err(|err| {
                 ApiError::internal(format!("failed to verify context ownership: {err}"))
@@ -1228,7 +1225,7 @@ async fn append_context_log(
     .bind(&severity)
     .bind(message)
     .bind(request.metadata_json)
-    .fetch_one(&pool)
+    .fetch_one(&ctx.pool)
     .await
     .map_err(|err| ApiError::internal(format!("failed to append context log: {err}")))?;
 
@@ -1257,423 +1254,4 @@ fn schema_version(value: &Value) -> Option<&str> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::{body::Body, http::Request};
-    use tower::ServiceExt;
-
-    fn test_state_with_database() -> AppState {
-        let pool = PgPoolOptions::new()
-            .connect_lazy("postgres://postgres:postgres@127.0.0.1:5432/inactu_control")
-            .expect("connect_lazy should accept a valid postgres url");
-
-        AppState {
-            service_name: "inactu-control",
-            service_version: "test",
-            database_enabled: true,
-            db_pool: Some(pool),
-            api_auth_secret: Some("test-secret".to_string()),
-        }
-    }
-
-    fn test_state_without_database() -> AppState {
-        AppState {
-            service_name: "inactu-control",
-            service_version: "test",
-            database_enabled: false,
-            db_pool: None,
-            api_auth_secret: Some("test-secret".to_string()),
-        }
-    }
-
-    async fn json_error_message(response: Response) -> String {
-        let value = json_body(response).await;
-        value
-            .get("error")
-            .and_then(|item| item.as_str())
-            .unwrap_or("")
-            .to_string()
-    }
-
-    async fn json_body(response: Response) -> Value {
-        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-            .await
-            .expect("response body should be readable");
-        serde_json::from_slice(&bytes).expect("response body should be json")
-    }
-
-    #[tokio::test]
-    async fn verify_manifest_accepts_v0() {
-        let app = router(test_state_without_database());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/verify/manifest")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"manifest":{"name":"echo.minimal","version":"0.1.0","entrypoint":"run","artifact":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","capabilities":[],"signers":["alice.dev"]}}"#
-                            .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should return a response");
-        assert_eq!(response.status(), StatusCode::OK);
-        let value = json_body(response).await;
-        assert_eq!(
-            value.get("schema_version").and_then(Value::as_str),
-            Some("0")
-        );
-        assert_eq!(
-            value.get("name").and_then(Value::as_str),
-            Some("echo.minimal")
-        );
-    }
-
-    #[tokio::test]
-    async fn verify_manifest_accepts_v1_draft() {
-        let app = router(test_state_without_database());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/verify/manifest")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"manifest":{"schema_version":"1.0.0-draft","id":"echo.minimal","version":"0.2.0","entrypoint":"run","artifact":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","inputs_schema":{"type":"object"},"outputs_schema":{"type":"object"},"capabilities":[],"signers":["alice.dev"]}}"#
-                            .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should return a response");
-        assert_eq!(response.status(), StatusCode::OK);
-        let value = json_body(response).await;
-        assert_eq!(
-            value.get("schema_version").and_then(Value::as_str),
-            Some("1.0.0-draft")
-        );
-        assert_eq!(
-            value.get("name").and_then(Value::as_str),
-            Some("echo.minimal")
-        );
-    }
-
-    #[tokio::test]
-    async fn verify_manifest_rejects_unknown_schema_version() {
-        let app = router(test_state_without_database());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/verify/manifest")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"manifest":{"schema_version":"9.9.9","name":"echo.minimal","version":"0.1.0","entrypoint":"run","artifact":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","capabilities":[],"signers":["alice.dev"]}}"#
-                            .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should return a response");
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let message = json_error_message(response).await;
-        assert!(message.contains("unsupported manifest schema version"));
-    }
-
-    #[tokio::test]
-    async fn verify_receipt_accepts_v0() {
-        let app = router(test_state_without_database());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/verify/receipt")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"receipt":{"artifact":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","inputs_hash":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","outputs_hash":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","caps_used":["env:HOME"],"timestamp":1738600999,"receipt_hash":"sha256:ba1b6579a010096532ca31c2680f7345bda8beb5dd290a427d101e3b584c50e7"}}"#
-                            .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should return a response");
-        assert_eq!(response.status(), StatusCode::OK);
-        let value = json_body(response).await;
-        assert_eq!(
-            value.get("schema_version").and_then(Value::as_str),
-            Some("0")
-        );
-        assert_eq!(value.get("valid").and_then(Value::as_bool), Some(true));
-    }
-
-    #[tokio::test]
-    async fn verify_receipt_accepts_v1_draft() {
-        let app = router(test_state_without_database());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/verify/receipt")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"receipt":{"schema_version":"1.0.0-draft","artifact":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","manifest_hash":"sha256:1111111111111111111111111111111111111111111111111111111111111111","policy_hash":"sha256:2222222222222222222222222222222222222222222222222222222222222222","bundle_hash":"sha256:abababababababababababababababababababababababababababababababab","inputs_hash":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","outputs_hash":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","runtime_version_digest":"sha256:1212121212121212121212121212121212121212121212121212121212121212","result_digest":"sha256:3434343434343434343434343434343434343434343434343434343434343434","caps_requested":["env:HOME"],"caps_granted":["env:HOME"],"caps_used":["env:HOME"],"result":{"status":"success","code":"ok"},"runtime":{"name":"inactu","version":"0.1.0","profile":"v1-draft"},"started_at":1738600000,"finished_at":1738600999,"timestamp_strategy":"local_untrusted_unix_seconds","receipt_hash":"sha256:3333333333333333333333333333333333333333333333333333333333333333"}}"#
-                            .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should return a response");
-        assert_eq!(response.status(), StatusCode::OK);
-        let value = json_body(response).await;
-        assert_eq!(
-            value.get("schema_version").and_then(Value::as_str),
-            Some("1.0.0-draft")
-        );
-        assert_eq!(value.get("valid").and_then(Value::as_bool), Some(true));
-    }
-
-    #[tokio::test]
-    async fn verify_receipt_rejects_unknown_schema_version() {
-        let app = router(test_state_without_database());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/verify/receipt")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"receipt":{"schema_version":"9.9.9","artifact":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","inputs_hash":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","outputs_hash":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","caps_used":["env:HOME"],"timestamp":1738600999,"receipt_hash":"sha256:ba1b6579a010096532ca31c2680f7345bda8beb5dd290a427d101e3b584c50e7"}}"#
-                            .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should return a response");
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let message = json_error_message(response).await;
-        assert!(message.contains("unsupported receipt schema version"));
-    }
-
-    #[tokio::test]
-    async fn contexts_endpoints_require_bearer_auth() {
-        let app = router(test_state_with_database());
-
-        let contexts_response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/contexts")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should return a response");
-        assert_eq!(contexts_response.status(), StatusCode::UNAUTHORIZED);
-
-        let context_response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/contexts/00000000-0000-0000-0000-000000000000")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should return a response");
-        assert_eq!(context_response.status(), StatusCode::UNAUTHORIZED);
-
-        let patch_context_response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("PATCH")
-                    .uri("/v1/contexts/00000000-0000-0000-0000-000000000000")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"status":"running"}"#.to_string()))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should return a response");
-        assert_eq!(patch_context_response.status(), StatusCode::UNAUTHORIZED);
-
-        let logs_response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/contexts/00000000-0000-0000-0000-000000000000/logs")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should return a response");
-        assert_eq!(logs_response.status(), StatusCode::UNAUTHORIZED);
-
-        let create_context_response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/contexts")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"status":"running","region":"local-dev"}"#.to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should return a response");
-        assert_eq!(create_context_response.status(), StatusCode::UNAUTHORIZED);
-
-        let append_log_response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/contexts/00000000-0000-0000-0000-000000000000/logs")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"severity":"info","message":"hello"}"#.to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should return a response");
-        assert_eq!(append_log_response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn contexts_endpoints_reject_non_bearer_authorization() {
-        let app = router(test_state_with_database());
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/contexts")
-                    .header("authorization", "Basic abc123")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should return a response");
-
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        let message = json_error_message(response).await;
-        assert_eq!(message, "authorization must be a bearer token");
-    }
-
-    #[tokio::test]
-    async fn contexts_endpoints_require_database_configuration() {
-        let app = router(test_state_without_database());
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/contexts")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should return a response");
-
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let message = json_error_message(response).await;
-        assert_eq!(message, "database is not configured");
-    }
-
-    #[tokio::test]
-    async fn rejects_oversized_json_payloads() {
-        let app = router(test_state_without_database());
-        let payload = "x".repeat(MAX_REQUEST_BODY_BYTES + 1);
-        let body = format!(r#"{{"payload":"{payload}"}}"#);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/hash/sha256")
-                    .header("content-type", "application/json")
-                    .body(Body::from(body))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should return a response");
-
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    }
-
-    #[test]
-    fn internal_errors_are_sanitized_for_clients() {
-        let err = ApiError::internal("db explode: relation missing");
-        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(err.message, "internal server error");
-    }
-
-    #[test]
-    fn create_context_requires_valid_status() {
-        let result = normalize_context_status_required("invalid");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn append_log_requires_valid_severity() {
-        let result = normalize_log_severity("trace");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn audit_severity_for_context_status_maps_failed_to_error() {
-        assert_eq!(audit_severity_for_context_status("failed"), "error");
-    }
-
-    #[test]
-    fn audit_severity_for_context_status_maps_stopped_to_warn() {
-        assert_eq!(audit_severity_for_context_status("stopped"), "warn");
-    }
-
-    #[test]
-    fn audit_severity_for_context_status_defaults_to_info() {
-        assert_eq!(audit_severity_for_context_status("running"), "info");
-    }
-
-    #[test]
-    fn normalize_rfc3339_timestamp_accepts_valid_values() {
-        let value = normalize_rfc3339_timestamp("from", Some("2026-02-06T12:30:00Z".to_string()))
-            .expect("timestamp should parse");
-        assert_eq!(value.as_deref(), Some("2026-02-06T12:30:00Z"));
-    }
-
-    #[test]
-    fn normalize_rfc3339_timestamp_rejects_invalid_values() {
-        let result = normalize_rfc3339_timestamp("to", Some("not-a-timestamp".to_string()));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn next_before_id_uses_oldest_log_id_in_page() {
-        let logs = vec![
-            ContextLogEntry {
-                id: 120,
-                ts: "2026-02-06T00:00:00Z".to_string(),
-                severity: "info".to_string(),
-                message: "newest".to_string(),
-                metadata_json: None,
-            },
-            ContextLogEntry {
-                id: 101,
-                ts: "2026-02-05T23:59:00Z".to_string(),
-                severity: "warn".to_string(),
-                message: "oldest".to_string(),
-                metadata_json: None,
-            },
-        ];
-
-        assert_eq!(next_before_id_from_logs(&logs), Some(101));
-    }
-
-    #[test]
-    fn next_before_id_is_none_for_empty_page() {
-        let logs: Vec<ContextLogEntry> = vec![];
-        assert_eq!(next_before_id_from_logs(&logs), None);
-    }
-}
+mod main_tests;
