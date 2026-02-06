@@ -67,7 +67,7 @@ This plan is scoped for single-user ownership first, with org support designed i
 - App sections: Packages, Package Detail, Publish, Contexts, Context Detail.
 - Session-aware API client (http-only cookie session preferred).
 
-### Backend (`src/main.rs` + new modules)
+### Backend (`src/bin/inactu-control-web.rs` + modules)
 - Rust API for auth, package registry, and context/log APIs.
 - Reuse existing verifier endpoints in package publish pipeline.
 - Introduce service modules:
