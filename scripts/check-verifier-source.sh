@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CARGO_TOML="$ROOT_DIR/Cargo.toml"
+
+if [[ -d "$ROOT_DIR/crates/inactu-verifier" ]]; then
+  echo "error: local crate 'crates/inactu-verifier' must not exist; use shared inactu verifier dependency"
+  exit 1
+fi
+
+if ! grep -Eq '^inactu-verifier\s*=\s*\{[^}]*git\s*=\s*"https://github.com/opertus-systems/inactu.git"[^}]*package\s*=\s*"inactu-verifier"' "$CARGO_TOML"; then
+  echo "error: Cargo.toml must declare inactu-verifier from the shared inactu git source"
+  exit 1
+fi
+
+if ! grep -Eq '^\[patch\."https://github.com/opertus-systems/inactu.git"\]' "$CARGO_TOML"; then
+  echo "error: Cargo.toml must include a local [patch] override for ../inactu/core/verifier"
+  exit 1
+fi
+
+if ! grep -Eq '^inactu-verifier\s*=\s*\{\s*path\s*=\s*"\.\./inactu/core/verifier"\s*\}' "$CARGO_TOML"; then
+  echo "error: Cargo.toml [patch] section must point inactu-verifier to ../inactu/core/verifier"
+  exit 1
+fi
+
+echo "ok: verifier source-of-truth checks passed"

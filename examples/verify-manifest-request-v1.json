@@ -1,0 +1,48 @@
+{
+  "manifest": {
+    "schema_version": "1.0.0-draft",
+    "id": "echo.minimal",
+    "name": "echo.minimal",
+    "version": "0.2.0",
+    "entrypoint": "run",
+    "artifact": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "inputs_schema": {
+      "type": "object"
+    },
+    "outputs_schema": {
+      "type": "object"
+    },
+    "capabilities": [],
+    "signers": [
+      "alice.dev"
+    ]
+  },
+  "policy": {
+    "version": 1,
+    "trusted_signers": [
+      "alice.dev",
+      "opertus.systems"
+    ],
+    "capability_ceiling": {
+      "fs": {
+        "read": [
+          "/data",
+          "/opt/inactu/public"
+        ],
+        "write": [
+          "/tmp"
+        ]
+      },
+      "net": [
+        "https://api.open-meteo.com",
+        "https://api.github.com"
+      ],
+      "env": [
+        "HOME",
+        "PATH"
+      ],
+      "exec": false,
+      "time": false
+    }
+  }
+}
