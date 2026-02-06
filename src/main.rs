@@ -1,7 +1,7 @@
 use std::{net::SocketAddr, path::Path as FsPath, str::FromStr};
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -18,7 +18,7 @@ use serde_json::Value;
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
-use tracing::{info, Level};
+use tracing::{error, info, Level};
 
 #[derive(Clone, Debug)]
 struct AppState {
@@ -275,9 +275,11 @@ impl ApiError {
     }
 
     fn internal(message: impl Into<String>) -> Self {
+        let detail = message.into();
+        error!(error = %detail, "internal API error");
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: message.into(),
+            message: "internal server error".to_string(),
         }
     }
 }
@@ -369,6 +371,7 @@ fn router(state: AppState) -> Router {
                 .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
                 .on_response(DefaultOnResponse::new().level(Level::INFO)),
         )
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
 }
 
@@ -1247,6 +1250,7 @@ fn next_before_id_from_logs(logs: &[ContextLogEntry]) -> Option<i64> {
 
 const EXPERIMENTAL_SCHEMA_VERSION: &str = "1.0.0-draft";
 const V0_SCHEMA_VERSION: &str = "0";
+const MAX_REQUEST_BODY_BYTES: usize = 1_048_576;
 
 fn schema_version(value: &Value) -> Option<&str> {
     value.get("schema_version").and_then(Value::as_str)
@@ -1575,6 +1579,34 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let message = json_error_message(response).await;
         assert_eq!(message, "database is not configured");
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_json_payloads() {
+        let app = router(test_state_without_database());
+        let payload = "x".repeat(MAX_REQUEST_BODY_BYTES + 1);
+        let body = format!(r#"{{"payload":"{payload}"}}"#);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/hash/sha256")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should return a response");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn internal_errors_are_sanitized_for_clients() {
+        let err = ApiError::internal("db explode: relation missing");
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err.message, "internal server error");
     }
 
     #[test]
